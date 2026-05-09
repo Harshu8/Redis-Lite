@@ -3,11 +3,13 @@
 #include <cstring>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include <netinet/in.h>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -22,6 +24,7 @@ private:
     size_t capacity;
     std::unordered_map<std::string, Entry> store;
     std::list<std::string> lruList;
+    std::mutex mutex;
 
     bool isExpired(const Entry& entry) const {
         return entry.expiryTime.has_value() &&
@@ -50,6 +53,8 @@ public:
         : capacity(maxCapacity) {}
 
     void set(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex);
+
         auto it = store.find(key);
 
         if (it != store.end()) {
@@ -65,6 +70,8 @@ public:
     }
 
     void setWithTTL(const std::string& key, const std::string& value, int seconds) {
+        std::lock_guard<std::mutex> lock(mutex);
+
         auto expiry =
             std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
 
@@ -83,9 +90,13 @@ public:
     }
 
     bool get(const std::string& key, std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex);
+
         auto it = store.find(key);
 
-        if (it == store.end()) return false;
+        if (it == store.end()) {
+            return false;
+        }
 
         if (isExpired(it->second)) {
             lruList.erase(it->second.lruIterator);
@@ -99,6 +110,8 @@ public:
     }
 
     bool remove(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex);
+
         auto it = store.find(key);
 
         if (it == store.end()) {
@@ -173,10 +186,41 @@ std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
     return "Unknown command\n";
 }
 
+void handleClient(int clientFd, KeyValueStore& kvStore) {
+    std::cout << "Client connected. Thread ID: "
+              << std::this_thread::get_id() << "\n";
+
+    char buffer[1024];
+
+    while (true) {
+        std::memset(buffer, 0, sizeof(buffer));
+
+        int bytesRead = recv(clientFd, buffer, sizeof(buffer) - 1, 0);
+
+        if (bytesRead <= 0) {
+            std::cout << "Client disconnected. Thread ID: "
+                      << std::this_thread::get_id() << "\n";
+            break;
+        }
+
+        std::string input(buffer);
+        std::string response = processCommand(kvStore, input);
+
+        send(clientFd, response.c_str(), response.size(), 0);
+
+        if (input.find("EXIT") == 0) {
+            break;
+        }
+    }
+
+    close(clientFd);
+}
+
 int main() {
     KeyValueStore kvStore(3);
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+
     if (serverFd == -1) {
         std::cerr << "Failed to create socket\n";
         return 1;
@@ -204,7 +248,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "Redis-lite server running on port 6379...\n";
+    std::cout << "Redis-lite multithreaded server running on port 6379...\n";
 
     while (true) {
         sockaddr_in clientAddress{};
@@ -220,31 +264,8 @@ int main() {
             continue;
         }
 
-        std::cout << "Client connected\n";
-
-        char buffer[1024];
-
-        while (true) {
-            std::memset(buffer, 0, sizeof(buffer));
-
-            int bytesRead = recv(clientFd, buffer, sizeof(buffer) - 1, 0);
-
-            if (bytesRead <= 0) {
-                std::cout << "Client disconnected\n";
-                break;
-            }
-
-            std::string input(buffer);
-            std::string response = processCommand(kvStore, input);
-
-            send(clientFd, response.c_str(), response.size(), 0);
-
-            if (input.find("EXIT") == 0) {
-                break;
-            }
-        }
-
-        close(clientFd);
+        std::thread clientThread(handleClient, clientFd, std::ref(kvStore));
+        clientThread.detach();
     }
 
     close(serverFd);
