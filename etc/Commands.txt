@@ -1,0 +1,6 @@
+Build and run command:
+mkdir build
+cd build
+cmake ..
+make
+./redis_lite
