@@ -1,17 +1,70 @@
 #include <arpa/inet.h>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <list>
 #include <mutex>
 #include <netinet/in.h>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
+
+std::string trim(const std::string& input) {
+    size_t start = input.find_first_not_of(" \n\r\t");
+    if (start == std::string::npos) return "";
+
+    size_t end = input.find_last_not_of(" \n\r\t");
+    return input.substr(start, end - start + 1);
+}
+
+class PersistenceManager {
+private:
+    std::string filename;
+    std::mutex fileMutex;
+
+public:
+    explicit PersistenceManager(const std::string& file)
+        : filename(file) {}
+
+    void appendCommand(const std::string& command) {
+        std::lock_guard<std::mutex> lock(fileMutex);
+
+        std::ofstream out(filename, std::ios::app);
+        if (!out.is_open()) {
+            std::cerr << "Failed to open AOF file\n";
+            return;
+        }
+
+        out << command << "\n";
+    }
+
+    std::vector<std::string> loadCommands() {
+        std::vector<std::string> commands;
+
+        std::ifstream in(filename);
+        if (!in.is_open()) {
+            return commands;
+        }
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim(line);
+            if (!line.empty()) {
+                commands.push_back(line);
+            }
+        }
+
+        return commands;
+    }
+};
 
 class KeyValueStore {
 private:
@@ -49,7 +102,7 @@ private:
     }
 
 public:
-    explicit KeyValueStore(size_t maxCapacity = 3)
+    explicit KeyValueStore(size_t maxCapacity = 100)
         : capacity(maxCapacity) {}
 
     void set(const std::string& key, const std::string& value) {
@@ -124,7 +177,14 @@ public:
     }
 };
 
-std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
+std::string processCommand(
+    KeyValueStore& kvStore,
+    PersistenceManager& persistence,
+    const std::string& rawInput,
+    bool shouldPersist = true
+) {
+    std::string input = trim(rawInput);
+
     std::stringstream ss(input);
     std::string command;
     ss >> command;
@@ -153,6 +213,10 @@ std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
             kvStore.set(key, value);
         }
 
+        if (shouldPersist) {
+            persistence.appendCommand(input);
+        }
+
         return "OK\n";
     }
 
@@ -172,11 +236,17 @@ std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
         std::string key;
         ss >> key;
 
-        if (kvStore.remove(key)) {
-            return "Deleted\n";
+        if (key.empty()) {
+            return "Usage: DELETE key\n";
         }
 
-        return "Key not found\n";
+        bool deleted = kvStore.remove(key);
+
+        if (shouldPersist && deleted) {
+            persistence.appendCommand(input);
+        }
+
+        return deleted ? "Deleted\n" : "Key not found\n";
     }
 
     if (command == "EXIT") {
@@ -186,7 +256,11 @@ std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
     return "Unknown command\n";
 }
 
-void handleClient(int clientFd, KeyValueStore& kvStore) {
+void handleClient(
+    int clientFd,
+    KeyValueStore& kvStore,
+    PersistenceManager& persistence
+) {
     std::cout << "Client connected. Thread ID: "
               << std::this_thread::get_id() << "\n";
 
@@ -204,11 +278,12 @@ void handleClient(int clientFd, KeyValueStore& kvStore) {
         }
 
         std::string input(buffer);
-        std::string response = processCommand(kvStore, input);
+        std::string response =
+            processCommand(kvStore, persistence, input, true);
 
         send(clientFd, response.c_str(), response.size(), 0);
 
-        if (input.find("EXIT") == 0) {
+        if (trim(input) == "EXIT") {
             break;
         }
     }
@@ -216,8 +291,90 @@ void handleClient(int clientFd, KeyValueStore& kvStore) {
     close(clientFd);
 }
 
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<int> clientQueue;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+
+    KeyValueStore& kvStore;
+    PersistenceManager& persistence;
+
+public:
+    ThreadPool(
+        size_t threadCount,
+        KeyValueStore& store,
+        PersistenceManager& persistenceManager
+    )
+        : stop(false),
+          kvStore(store),
+          persistence(persistenceManager) {
+        for (size_t i = 0; i < threadCount; ++i) {
+            workers.emplace_back([this]() {
+                while (true) {
+                    int clientFd;
+
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+
+                        condition.wait(lock, [this]() {
+                            return stop || !clientQueue.empty();
+                        });
+
+                        if (stop && clientQueue.empty()) {
+                            return;
+                        }
+
+                        clientFd = clientQueue.front();
+                        clientQueue.pop();
+                    }
+
+                    handleClient(clientFd, kvStore, persistence);
+                }
+            });
+        }
+    }
+
+    void addClient(int clientFd) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            clientQueue.push(clientFd);
+        }
+
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+
+        condition.notify_all();
+
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+};
+
 int main() {
-    KeyValueStore kvStore(3);
+    KeyValueStore kvStore(100);
+    PersistenceManager persistence("appendonly.aof");
+
+    std::vector<std::string> oldCommands = persistence.loadCommands();
+
+    for (const auto& command : oldCommands) {
+        processCommand(kvStore, persistence, command, false);
+    }
+
+    std::cout << "Recovered "
+              << oldCommands.size()
+              << " commands from appendonly.aof\n";
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -234,9 +391,11 @@ int main() {
     serverAddress.sin_addr.s_addr = INADDR_ANY;
     serverAddress.sin_port = htons(6379);
 
-    if (bind(serverFd,
-             reinterpret_cast<sockaddr*>(&serverAddress),
-             sizeof(serverAddress)) < 0) {
+    if (bind(
+            serverFd,
+            reinterpret_cast<sockaddr*>(&serverAddress),
+            sizeof(serverAddress)
+        ) < 0) {
         std::cerr << "Bind failed\n";
         close(serverFd);
         return 1;
@@ -248,24 +407,28 @@ int main() {
         return 1;
     }
 
-    std::cout << "Redis-lite multithreaded server running on port 6379...\n";
+    ThreadPool threadPool(4, kvStore, persistence);
+
+    std::cout << "Redis-lite server running on port 6379...\n";
+    std::cout << "AOF persistence enabled: appendonly.aof\n";
 
     while (true) {
         sockaddr_in clientAddress{};
         socklen_t clientLen = sizeof(clientAddress);
 
         int clientFd =
-            accept(serverFd,
-                   reinterpret_cast<sockaddr*>(&clientAddress),
-                   &clientLen);
+            accept(
+                serverFd,
+                reinterpret_cast<sockaddr*>(&clientAddress),
+                &clientLen
+            );
 
         if (clientFd < 0) {
             std::cerr << "Failed to accept client\n";
             continue;
         }
 
-        std::thread clientThread(handleClient, clientFd, std::ref(kvStore));
-        clientThread.detach();
+        threadPool.addClient(clientFd);
     }
 
     close(serverFd);
