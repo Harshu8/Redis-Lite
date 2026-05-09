@@ -1,24 +1,47 @@
+#include <chrono>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 
 class KeyValueStore {
 private:
-    std::unordered_map<std::string, std::string> store;
+    struct Entry {
+        std::string value;
+        std::optional<std::chrono::steady_clock::time_point> expiryTime;
+    };
+
+    std::unordered_map<std::string, Entry> store;
+
+    bool isExpired(const Entry& entry) const {
+        return entry.expiryTime.has_value() &&
+               std::chrono::steady_clock::now() >= entry.expiryTime.value();
+    }
 
 public:
     void set(const std::string& key, const std::string& value) {
-        store[key] = value;
+        store[key] = {value, std::nullopt};
     }
 
-    bool get(const std::string& key, std::string& value) const {
+    void setWithTTL(const std::string& key, const std::string& value, int seconds) {
+        auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        store[key] = {value, expiry};
+    }
+
+    bool get(const std::string& key, std::string& value) {
         auto it = store.find(key);
+
         if (it == store.end()) {
             return false;
         }
 
-        value = it->second;
+        if (isExpired(it->second)) {
+            store.erase(it);
+            return false;
+        }
+
+        value = it->second.value;
         return true;
     }
 
@@ -46,11 +69,27 @@ int main() {
             ss >> key >> value;
 
             if (key.empty() || value.empty()) {
-                std::cout << "Usage: SET key value\n";
+                std::cout << "Usage: SET key value OR SET key value EX seconds\n";
                 continue;
             }
 
-            kvStore.set(key, value);
+            std::string option;
+            ss >> option;
+
+            if (option == "EX") {
+                int seconds;
+                ss >> seconds;
+
+                if (seconds <= 0) {
+                    std::cout << "TTL must be greater than 0\n";
+                    continue;
+                }
+
+                kvStore.setWithTTL(key, value, seconds);
+            } else {
+                kvStore.set(key, value);
+            }
+
             std::cout << "OK\n";
         }
         else if (command == "GET") {
