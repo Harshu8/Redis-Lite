@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <list>
 #include <netinet/in.h>
 #include <optional>
 #include <sstream>
@@ -15,23 +16,70 @@ private:
     struct Entry {
         std::string value;
         std::optional<std::chrono::steady_clock::time_point> expiryTime;
+        std::list<std::string>::iterator lruIterator;
     };
 
+    size_t capacity;
     std::unordered_map<std::string, Entry> store;
+    std::list<std::string> lruList;
 
     bool isExpired(const Entry& entry) const {
         return entry.expiryTime.has_value() &&
                std::chrono::steady_clock::now() >= entry.expiryTime.value();
     }
 
+    void touch(const std::string& key) {
+        auto it = store.find(key);
+        if (it == store.end()) return;
+
+        lruList.erase(it->second.lruIterator);
+        lruList.push_front(key);
+        it->second.lruIterator = lruList.begin();
+    }
+
+    void evictIfNeeded() {
+        while (store.size() > capacity) {
+            std::string keyToRemove = lruList.back();
+            lruList.pop_back();
+            store.erase(keyToRemove);
+        }
+    }
+
 public:
+    explicit KeyValueStore(size_t maxCapacity = 3)
+        : capacity(maxCapacity) {}
+
     void set(const std::string& key, const std::string& value) {
-        store[key] = {value, std::nullopt};
+        auto it = store.find(key);
+
+        if (it != store.end()) {
+            it->second.value = value;
+            it->second.expiryTime = std::nullopt;
+            touch(key);
+            return;
+        }
+
+        lruList.push_front(key);
+        store[key] = {value, std::nullopt, lruList.begin()};
+        evictIfNeeded();
     }
 
     void setWithTTL(const std::string& key, const std::string& value, int seconds) {
-        auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-        store[key] = {value, expiry};
+        auto expiry =
+            std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+
+        auto it = store.find(key);
+
+        if (it != store.end()) {
+            it->second.value = value;
+            it->second.expiryTime = expiry;
+            touch(key);
+            return;
+        }
+
+        lruList.push_front(key);
+        store[key] = {value, expiry, lruList.begin()};
+        evictIfNeeded();
     }
 
     bool get(const std::string& key, std::string& value) {
@@ -40,16 +88,26 @@ public:
         if (it == store.end()) return false;
 
         if (isExpired(it->second)) {
+            lruList.erase(it->second.lruIterator);
             store.erase(it);
             return false;
         }
 
         value = it->second.value;
+        touch(key);
         return true;
     }
 
     bool remove(const std::string& key) {
-        return store.erase(key) > 0;
+        auto it = store.find(key);
+
+        if (it == store.end()) {
+            return false;
+        }
+
+        lruList.erase(it->second.lruIterator);
+        store.erase(it);
+        return true;
     }
 };
 
@@ -108,11 +166,15 @@ std::string processCommand(KeyValueStore& kvStore, const std::string& input) {
         return "Key not found\n";
     }
 
+    if (command == "EXIT") {
+        return "Bye!\n";
+    }
+
     return "Unknown command\n";
 }
 
 int main() {
-    KeyValueStore kvStore;
+    KeyValueStore kvStore(3);
 
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd == -1) {
@@ -128,7 +190,9 @@ int main() {
     serverAddress.sin_addr.s_addr = INADDR_ANY;
     serverAddress.sin_port = htons(6379);
 
-    if (bind(serverFd, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) < 0) {
+    if (bind(serverFd,
+             reinterpret_cast<sockaddr*>(&serverAddress),
+             sizeof(serverAddress)) < 0) {
         std::cerr << "Bind failed\n";
         close(serverFd);
         return 1;
@@ -146,7 +210,11 @@ int main() {
         sockaddr_in clientAddress{};
         socklen_t clientLen = sizeof(clientAddress);
 
-        int clientFd = accept(serverFd, reinterpret_cast<sockaddr*>(&clientAddress), &clientLen);
+        int clientFd =
+            accept(serverFd,
+                   reinterpret_cast<sockaddr*>(&clientAddress),
+                   &clientLen);
+
         if (clientFd < 0) {
             std::cerr << "Failed to accept client\n";
             continue;
@@ -170,6 +238,10 @@ int main() {
             std::string response = processCommand(kvStore, input);
 
             send(clientFd, response.c_str(), response.size(), 0);
+
+            if (input.find("EXIT") == 0) {
+                break;
+            }
         }
 
         close(clientFd);
